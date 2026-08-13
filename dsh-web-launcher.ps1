@@ -36,6 +36,8 @@ param(
   [string]$BindHost = '',
   [int]$RestartDelay = 2,
   [string]$LogDir = (Join-Path $PSScriptRoot 'logs'),
+  [string]$ChildCmd = '',
+  [string]$ChildArgs = '',
   [switch]$Stop,
   [switch]$Start
 )
@@ -115,6 +117,38 @@ if ($Start) {
 Write-Log "launcher starting. guarding dsh web on port $Port (crash-restart delay ${RestartDelay}s)."
 
 function Start-DataNode {
+  # Advanced hook (also used by tests): point the supervisor at any command.
+  if ($ChildCmd) {
+    $argList = @()
+    if ($ChildArgs) { $argList = @($ChildArgs) }
+    $outFile = Join-Path $LogDir 'child-stdout.log'
+    $errFile = Join-Path $LogDir 'child-stderr.log'
+    $psParams = @{
+      FilePath          = $ChildCmd
+      ArgumentList      = $argList
+      WorkingDirectory  = $env:USERPROFILE
+      WindowStyle       = 'Hidden'
+      PassThru          = $true
+    }
+    $proc = $null
+    try {
+      $psParams.RedirectStandardOutput = $outFile
+      $psParams.RedirectStandardError  = $errFile
+      $proc = Start-Process @psParams
+    } catch {
+      $psParams.Remove('RedirectStandardOutput')
+      $psParams.Remove('RedirectStandardError')
+      try { $proc = Start-Process @psParams } catch {
+        Write-Log "failed to start child: $($_.Exception.Message)"
+        return $null
+      }
+    }
+    if (-not $proc) { return $null }
+    $proc.Id | Out-File -FilePath $pidFile -Encoding ascii
+    Write-Log "started custom child (pid $($proc.Id)): $ChildCmd $ChildArgs"
+    return $proc
+  }
+
   $node = (Get-Command node -ErrorAction SilentlyContinue).Source
   if (-not $node) { $node = 'C:\Program Files\nodejs\node.exe' }
   if (-not (Test-Path $node)) { throw "node executable not found: $node" }

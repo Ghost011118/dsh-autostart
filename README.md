@@ -1,5 +1,7 @@
 # dsh-autostart —— dsh web 开机自启 + 隐藏窗口 + 崩溃自动重启
 
+> 🌐 **English**: see **[README.en.md](README.en.md)**
+
 一个 Windows 小工具包，让 **DeepSeek Harness 的网页端（`dsh web`，默认
 `http://127.0.0.1:3080`）** 做到：
 
