@@ -39,19 +39,16 @@ if /I "%~1"=="-start"     goto :start
 REM ---------- 1) install autostart ----------
 echo.
 echo [1/3] installing autostart (logon startup) ...
-copy /y "%SRC%%VBS%" "%STARTUP%\%VBS%" >nul 2>&1
-if exist "%STARTUP%\%VBS%" (
-  echo   OK  - autostart installed: %STARTUP%\%VBS%
+REM The Startup entry is RENDERED (not copied) so it carries the absolute
+REM launcher path and points back at this install dir; a plain copy would leave
+REM the vbs looking for dsh-web-launcher.ps1 inside the Startup folder, where it
+REM never is (root cause of autostart silently doing nothing).
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%render-autostart-vbs.ps1" -InstallDir "%SRC%"
+if errorlevel 1 (
+  echo   WARN- could not render autostart into Startup. Autostart skipped,
+  echo         but the supervisor can still start below.
 ) else (
-  echo   trying machine-wide Startup (may need admin) ...
-  copy /y "%SRC%%VBS%" "%ADMIN_STARTUP%\%VBS%" >nul 2>&1
-  if exist "%ADMIN_STARTUP%\%VBS%" (
-    echo   OK  - autostart installed: %ADMIN_STARTUP%\%VBS%
-  ) else (
-    echo   WARN- could not write Startup folder. Right-click -Run as
-    echo         administrator- to retry. Autostart skipped, but the
-    echo         supervisor can still start below.
-  )
+  echo   OK  - autostart installed (see line above)
 )
 
 REM ---------- 2) start / adopt supervisor now ----------

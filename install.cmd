@@ -44,19 +44,15 @@ if /I "%~1"=="-uninstall" (
 )
 
 REM ---------- install (default) ----------
-echo [install] copying launcher into the Startup folder ...
-copy /y "%SRC%%VBS%" "%STARTUP%\%VBS%" >nul
-if exist "%STARTUP%\%VBS%" (
-  echo [install] installed: %STARTUP%\%VBS%
-) else (
-  echo [install] user Startup write failed, trying machine Startup ...
-  copy /y "%SRC%%VBS%" "%ADMIN_STARTUP%\%VBS%" >nul
-  if exist "%ADMIN_STARTUP%\%VBS%" (
-    echo [install] installed: %ADMIN_STARTUP%\%VBS%
-  ) else (
-    echo [install] ERROR: could not write Startup folder; run as Administrator.
-    goto :eof
-  )
+echo [install] rendering autostart entry into the Startup folder ...
+REM Render (not copy) the Startup vbs so it carries the ABSOLUTE launcher path
+REM and points back at this install dir; a plain copy leaves the vbs looking for
+REM dsh-web-launcher.ps1 inside Startup, where it never is (autostart silently
+REM did nothing).
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%render-autostart-vbs.ps1" -InstallDir "%SRC%"
+if errorlevel 1 (
+  echo [install] ERROR: could not render Startup entry; run as Administrator.
+  goto :eof
 )
 
 echo [install] Ready. Start now by running start-dsh-web.vbs in this folder,

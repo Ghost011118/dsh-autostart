@@ -82,6 +82,8 @@ setup.cmd -uninstall 移除开机自启（不停掉正在运行的 dsh web）
 
 这样可以显著减少手动/守护多实例启动时出现的“`no API key`”类问题。
 
+`setup.cmd` / `install.cmd` 安装开机自启时是**渲染**（而不是复制）`start-dsh-web.vbs`：生成的 Startup 入口内嵌了本工具安装目录的**绝对 launcher 路径**。之前直接复制会让 vbs 去 Startup 文件夹里找 `dsh-web-launcher.ps1`（它并不在那里），导致开机自启静默失败——这正是“每次都要手动重启”的根因，现已修复。
+
 ---
 
 ## 🧑‍💻 开发者

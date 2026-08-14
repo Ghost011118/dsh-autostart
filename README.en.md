@@ -93,6 +93,13 @@ Before it launches `dsh web`, `dsh-web-launcher.ps1`:
 All of this cuts down on the intermittent “`no API key`” errors that manual or
 multi-instance startup can otherwise cause.
 
+`setup.cmd` / `install.cmd` now **render** (instead of copy) the autostart entry
+`start-dsh-web.vbs`: the generated Startup file embeds the **absolute launcher
+path** of this install directory. A plain copy used to make the vbs look for
+`dsh-web-launcher.ps1` *inside* the Startup folder, where it never lived, so
+autostart silently did nothing — the root cause of “I always have to restart it
+manually”. That is now fixed.
+
 ---
 
 ## License
