@@ -75,6 +75,24 @@ Changes take effect immediately — no reinstall needed.
 - If another autostart / scheduled task already manages `dsh web`, don't enable
   this one on top.
 
+## Supervisor robustness
+
+Before it launches `dsh web`, `dsh-web-launcher.ps1`:
+
+- **Locates `dsh`'s bin.js automatically** — it resolves the `dsh` shim on the
+  PATH first, then falls back to a global install or the npx cache, so a
+  non-global install never leaves the supervisor unable to find the entry point;
+- **Pins `DSH_HOME`** — if unset in the environment it is set explicitly to
+  `~/.dsh`, so dsh reads the correct user-data root (and its `.credentials.yaml`)
+  regardless of the session/logon context the guard was spawned from;
+- **Exports `DEEPSEEK_API_KEY` as a fallback** — if `~/.dsh/.credentials.yaml`
+  carries the key but the outer environment does not, it is injected into the
+  launched process, giving dsh a second reliable source beside the credentials
+  seam.
+
+All of this cuts down on the intermittent “`no API key`” errors that manual or
+multi-instance startup can otherwise cause.
+
 ---
 
 ## License

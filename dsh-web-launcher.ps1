@@ -48,7 +48,34 @@ $pidFile  = Join-Path $runDir 'dsh-web.pid'
 $stopFile = Join-Path $runDir 'stop.sentinel'
 $stampName = Get-Date -Format 'yyyyMMdd-HHmmss'
 $logFile  = Join-Path $LogDir "launcher-$stampName.log"
-$dshBin   = Join-Path $env:APPDATA 'npm\node_modules\@deepseek-ai\dsh\lib\bin.js'
+# Locate the dsh bin.js. Prefer resolving the `dsh` shim (cmd/ps1) on PATH,
+# then fall back to a global install or the npx cache it was run through.
+function Resolve-DshBin {
+  # 1) any dsh shim on the PATH (cmd/ps1) -> node_modules/@deepseek-ai/dsh
+  $cmd = Get-Command dsh -ErrorAction SilentlyContinue
+  if ($cmd -and $cmd.Source) {
+    $dir = Split-Path $cmd.Source -Parent
+    $nm = Split-Path $dir -Parent
+    $bin = Join-Path $nm '@deepseek-ai\dsh\lib\bin.js'
+    if (Test-Path $bin) { return $bin }
+  }
+  # 2) a global @deepseek-ai/dsh install
+  $globalBin = Join-Path $env:APPDATA 'npm\node_modules\@deepseek-ai\dsh\lib\bin.js'
+  if (Test-Path $globalBin) { return $globalBin }
+  # 3) the npx cache that `npx @deepseek-ai/dsh` left behind (any hashed dir)
+  if ($env:LOCALAPPDATA) {
+    $cacheRoot = Join-Path $env:LOCALAPPDATA 'npm-cache\_npx'
+    if (Test-Path $cacheRoot) {
+      foreach ($dir in Get-ChildItem $cacheRoot -Directory -ErrorAction SilentlyContinue) {
+        $cand = Join-Path $dir.FullName 'node_modules\@deepseek-ai\dsh\lib\bin.js'
+        if (Test-Path $cand) { return $cand }
+      }
+    }
+  }
+  return $null
+}
+$dshBin = Resolve-DshBin
+if (-not $dshBin) { throw "dsh bin.js not found" }
 
 New-Item -ItemType Directory -Force -Path $runDir | Out-Null
 New-Item -ItemType Directory -Force -Path $LogDir   | Out-Null
@@ -117,6 +144,33 @@ if ($Start) {
 Write-Log "launcher starting. guarding dsh web on port $Port (crash-restart delay ${RestartDelay}s)."
 
 function Start-DataNode {
+  # Ensure the harness home resolves to ~/.dsh regardless of how the guard was
+  # launched, so the credentials document is always found. DSH_HOME unset uses
+  # process home by default, but pinning it removes any ambiguity when the guard
+  # is spawned from a different login/session context.
+  if ([string]::IsNullOrEmpty($env:DSH_HOME)) {
+    $env:DSH_HOME = Join-Path $env:USERPROFILE '.dsh'
+  }
+  # Best-effort credential fallback: if the credentials document holds
+  # DEEPSEEK_API_KEY but the inherited environment does not, export it for the
+  # freshly spawned dsh. This makes the key available through the launching
+  # environment even before/without the credentials seam settling, which in turn
+  # avoids intermittent "no API key" failures on this route.
+  if (-not $env:DEEPSEEK_API_KEY) {
+    $credDoc = Join-Path $env:DSH_HOME '.credentials.yaml'
+    if (Test-Path $credDoc) {
+      try {
+        $text = Get-Content $credDoc -Raw
+        if ($text -match '^\s*DEEPSEEK_API_KEY\s*:\s*(\S+)' -and $Matches[1] -ne '') {
+          $env:DEEPSEEK_API_KEY = $Matches[1]
+          Write-Log "exported DEEPSEEK_API_KEY from $credDoc into the dsh child environment"
+        }
+      } catch {
+        Write-Log "could not read $credDoc for DEEPSEEK_API_KEY fallback: $($_.Exception.Message)"
+      }
+    }
+  }
+
   # Advanced hook (also used by tests): point the supervisor at any command.
   if ($ChildCmd) {
     $argList = @()
