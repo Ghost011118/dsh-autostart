@@ -36,7 +36,10 @@
 ```
 setup.cmd            一键配置并启动守护
 setup.cmd -stop      停止 dsh web 并禁用自动重启
+setup.cmd -pause     暂停自动重启，但保留当前 dsh web 继续运行
 setup.cmd -start     恢复守护（清除停止标记）
+setup.cmd -restart   立即请求一次受控重启
+setup.cmd -control   打开按需运行的轻量控制面板
 setup.cmd -uninstall 移除开机自启（不停掉正在运行的 dsh web）
 ```
 
@@ -49,6 +52,7 @@ setup.cmd -uninstall 移除开机自启（不停掉正在运行的 dsh web）
 | `setup.cmd` | **一键入口**，双击即用（中文界面） |
 | `start-dsh-web.vbs` | 开机隐形启动入口（登录时以隐藏窗口拉起守护） |
 | `dsh-web-launcher.ps1` | 守护进程本体：隐藏启动、接管现有实例、崩溃自动重启、哨兵控制 |
+| `control-dsh.cmd` / `dsh-control.ps1` | 按需控制面板；关闭后不保留托盘或界面进程 |
 | `install.cmd` | 细粒度安装/卸载（`-start` / `-stop` / `-uninstall`） |
 | `readme.txt` / `说明.txt` | 中文使用说明 |
 | `logs/` `run/` | 运行时目录（自动生成，不入库） |
@@ -63,6 +67,18 @@ setup.cmd -uninstall 移除开机自启（不停掉正在运行的 dsh web）
 - `-RestartDelay`：崩溃重启间隔（秒），默认 `2`。
 
 改完即生效，无需重新安装。
+
+## 更新检测与安全暂停
+
+守护进程默认每 5 秒只检查一组明确文件：DSH 安装包的 `package.json` 与
+`lib/bin.js`；web profile 的 `cordis.yml`、`cordis.patch.yml`、
+`package.json`、`pnpm-lock.yaml`；以及 web profile 直接依赖的
+`package.json` 和声明的 main 入口。它不会递归扫描 `node_modules`，也不
+读取 sessions、storages 或日志。指纹连续两次稳定变化后才重启，避免在
+npm/pnpm 正更新到一半时启动。
+
+`-pause` 只暂停自动重启，当前 DSH 保持运行；`-stop` 才会停止当前 DSH
+并暂停后续重启。所有控制命令都会快速返回。
 
 ---
 

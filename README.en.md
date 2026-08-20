@@ -36,7 +36,10 @@ From then on `dsh web` is supervised: autostart on logon, restart on crash.
 ```
 setup.cmd            one-click: configure + start supervision
 setup.cmd -stop      stop dsh web and disable auto-restart
+setup.cmd -pause     pause auto-restart but leave the current dsh web running
 setup.cmd -start     resume supervision (clear the stop sentinel)
+setup.cmd -restart   request an immediate supervised restart
+setup.cmd -control   open the on-demand lightweight control panel
 setup.cmd -uninstall remove autostart (does NOT stop a running dsh web)
 ```
 
@@ -49,6 +52,7 @@ setup.cmd -uninstall remove autostart (does NOT stop a running dsh web)
 | `setup.cmd` | **one-click entry** — double-click to use |
 | `start-dsh-web.vbs` | hidden logon entry (starts the supervisor at logon) |
 | `dsh-web-launcher.ps1` | the supervisor: hidden start, adopt existing, crash restart, sentinel control |
+| `control-dsh.cmd` / `dsh-control.ps1` | on-demand control panel; closing it leaves no tray/UI process resident |
 | `install.cmd` | fine-grained install/uninstall (`-start` / `-stop` / `-uninstall`) |
 | `readme.txt` / `说明.txt` | detailed usage docs |
 | `logs/` `run/` | runtime directories (auto-created, git-ignored) |
@@ -63,6 +67,20 @@ Edit the parameters at the top of `dsh-web-launcher.ps1`:
 - `-RestartDelay`: crash-restart delay in seconds, default `2`.
 
 Changes take effect immediately — no reinstall needed.
+
+## Update-aware restart and safe pause
+
+Every five seconds, the supervisor checks a small, explicit set of files: the
+installed DSH `package.json` and `lib/bin.js`; the web profile's `cordis.yml`,
+`cordis.patch.yml`, `package.json`, and `pnpm-lock.yaml`; and only the
+`package.json` plus declared main entry of direct web-profile dependencies.
+It never recursively scans `node_modules`, sessions, storages, profiles, or
+logs. A changed fingerprint must remain stable for two checks before DSH is
+restarted, avoiding a restart in the middle of an npm/pnpm update.
+
+`-pause` only disables supervision and leaves the current DSH process running.
+`-stop` is deliberately stronger: it stops the tracked DSH and pauses future
+restarts. `-start`, `-pause`, `-stop`, `-restart`, and `-status` return quickly.
 
 ---
 

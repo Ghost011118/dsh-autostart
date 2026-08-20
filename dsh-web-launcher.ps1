@@ -8,7 +8,7 @@
     * launches `dsh web` with a hidden window (no console black box)
     * redirects stdout/stderr into logs\ (falls back to no-redirect if blocked)
     * monitors the child and auto-restarts it when it exits unexpectedly
-    * uses a pid file + stop sentinel so a manual stop is not overridden
+    * uses verified process state + a pause sentinel for safe user control
 
   Usage
   -----
@@ -19,13 +19,14 @@
         # manual stop: write sentinel, kill the guarded dsh web, exit supervision
 
     powershell -NoProfile -ExecutionPolicy Bypass -File dsh-web-launcher.ps1 -Start
-        # clear the stop sentinel and resume supervision
+        # clear the pause sentinel, spawn one hidden supervisor, and return
 
   Optional parameters
   -------------------
     -Port           default 3080, forwarded to dsh web as --port
     -BindHost       optional, forwarded to dsh web as --host
-    -RestartDelay   seconds to wait after a crash before restarting (default 5)
+    -RestartDelay   seconds to wait after a crash before restarting (default 2)
+    -UpdateCheckInterval seconds between bounded update checks (default 5)
     -LogDir         log directory (default: logs\ beside this script)
 
   NOTE: this file is intentionally ASCII-only so it survives any codepage /
@@ -35,19 +36,26 @@ param(
   [int]$Port = 3080,
   [string]$BindHost = '',
   [int]$RestartDelay = 2,
+  [ValidateRange(2, 300)][int]$UpdateCheckInterval = 5,
   [string]$LogDir = (Join-Path $PSScriptRoot 'logs'),
   [string]$ChildCmd = '',
   [string]$ChildArgs = '',
   [switch]$Stop,
-  [switch]$Start
+  [switch]$Pause,
+  [switch]$Start,
+  [switch]$Restart,
+  [switch]$Status
 )
 
 $ErrorActionPreference = 'Stop'
 $runDir   = Join-Path $PSScriptRoot 'run'
 $pidFile  = Join-Path $runDir 'dsh-web.pid'
-$stopFile = Join-Path $runDir 'stop.sentinel'
+$stateFile = Join-Path $runDir 'dsh-web.json'
+$stopFile = Join-Path $runDir 'pause.sentinel'
+$legacyStopFile = Join-Path $runDir 'stop.sentinel'
+$supervisorFile = Join-Path $runDir 'supervisor.json'
 $stampName = Get-Date -Format 'yyyyMMdd-HHmmss'
-$logFile  = Join-Path $LogDir "launcher-$stampName.log"
+$logFile  = Join-Path $LogDir "launcher-$stampName-$PID.log"
 # Locate the dsh bin.js. Prefer resolving the `dsh` shim (cmd/ps1) on PATH,
 # then fall back to a global install or the npx cache it was run through.
 function Resolve-DshBin {
@@ -55,8 +63,7 @@ function Resolve-DshBin {
   $cmd = Get-Command dsh -ErrorAction SilentlyContinue
   if ($cmd -and $cmd.Source) {
     $dir = Split-Path $cmd.Source -Parent
-    $nm = Split-Path $dir -Parent
-    $bin = Join-Path $nm '@deepseek-ai\dsh\lib\bin.js'
+    $bin = Join-Path $dir 'node_modules\@deepseek-ai\dsh\lib\bin.js'
     if (Test-Path $bin) { return $bin }
   }
   # 2) a global @deepseek-ai/dsh install
@@ -66,7 +73,7 @@ function Resolve-DshBin {
   if ($env:LOCALAPPDATA) {
     $cacheRoot = Join-Path $env:LOCALAPPDATA 'npm-cache\_npx'
     if (Test-Path $cacheRoot) {
-      foreach ($dir in Get-ChildItem $cacheRoot -Directory -ErrorAction SilentlyContinue) {
+      foreach ($dir in Get-ChildItem $cacheRoot -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending) {
         $cand = Join-Path $dir.FullName 'node_modules\@deepseek-ai\dsh\lib\bin.js'
         if (Test-Path $cand) { return $cand }
       }
@@ -74,9 +81,6 @@ function Resolve-DshBin {
   }
   return $null
 }
-$dshBin = Resolve-DshBin
-if (-not $dshBin) { throw "dsh bin.js not found" }
-
 New-Item -ItemType Directory -Force -Path $runDir | Out-Null
 New-Item -ItemType Directory -Force -Path $LogDir   | Out-Null
 
@@ -85,17 +89,74 @@ function Write-Log($msg) {
   try { Add-Content -Path $logFile -Value "[$stamp] $msg" } catch { }
 }
 
+function Read-JsonFile($path) {
+  if (-not (Test-Path -LiteralPath $path)) { return $null }
+  try { return Get-Content -LiteralPath $path -Raw | ConvertFrom-Json } catch { return $null }
+}
+
+function Write-ProcessRecord($path, $proc, $kind) {
+  try { $started = $proc.StartTime.ToUniversalTime().ToString('o') } catch { $started = $null }
+  $record = [ordered]@{ pid = [int]$proc.Id; startTimeUtc = $started; kind = $kind }
+  $tmp = "$path.$PID.tmp"
+  $record | ConvertTo-Json -Compress | Set-Content -LiteralPath $tmp -Encoding UTF8
+  Move-Item -LiteralPath $tmp -Destination $path -Force
+}
+
+function Get-ProcessCommandLine([int]$processId) {
+  try {
+    $item = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction Stop
+    if ($item) { return [string]$item.CommandLine }
+  } catch { }
+  return ''
+}
+
+function Test-IsDshWebProcess([int]$processId) {
+  $line = Get-ProcessCommandLine $processId
+  return ($line -and
+    $line -match '(?i)@deepseek-ai[\\/]dsh[\\/](?:lib[\\/])?bin\.js' -and
+    $line -match '(?i)(?:^|[\s"])(?:web)(?:[\s"]|$)')
+}
+
 function Get-ManagedPid {
+  $record = Read-JsonFile $stateFile
+  if ($record -and $record.pid) {
+    $proc = Get-Process -Id ([int]$record.pid) -ErrorAction SilentlyContinue
+    if (-not $proc) { return $null }
+    try {
+      if ($record.startTimeUtc -is [DateTime]) {
+        $expected = ([DateTime]$record.startTimeUtc).ToUniversalTime()
+      } else {
+        $expected = [DateTimeOffset]::Parse([string]$record.startTimeUtc,
+          [Globalization.CultureInfo]::InvariantCulture,
+          [Globalization.DateTimeStyles]::RoundtripKind).UtcDateTime
+      }
+      if ([Math]::Abs(($proc.StartTime.ToUniversalTime() - $expected).TotalSeconds) -gt 1) { return $null }
+    } catch { return $null }
+    if ([string]$record.kind -ne 'custom' -and -not (Test-IsDshWebProcess $proc.Id)) { return $null }
+    return [int]$proc.Id
+  }
   if (Test-Path $pidFile) {
-    $raw = (Get-Content $pidFile -Raw).Trim()
-    if ($raw -match '^\d+$') { return [int]$raw }
+    try {
+      $raw = (Get-Content $pidFile -Raw).Trim()
+      if ($raw -match '^\d+$') {
+        $legacyId = [int]$raw
+        # A legacy PID file has no creation timestamp. Only retain backwards
+        # compatibility when the same PID both proves it is dsh web and owns
+        # this supervisor instance's configured listening port.
+        $portOwner = Find-PortOwner $Port
+        if ($portOwner -eq $legacyId -and (Test-IsDshWebProcess $legacyId)) { return $legacyId }
+      }
+    } catch { }
   }
   return $null
 }
 
 function Stop-ManagedInstance {
   $id = Get-ManagedPid
-  if (-not $id) { return }
+  if (-not $id) {
+    Remove-Item $pidFile,$stateFile -Force -ErrorAction SilentlyContinue
+    return
+  }
   $proc = Get-Process -Id $id -ErrorAction SilentlyContinue
   if ($proc) {
     try { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue } catch { }
@@ -104,7 +165,7 @@ function Stop-ManagedInstance {
   } else {
     Write-Log "managed pid $id not running (already exited)"
   }
-  Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+  Remove-Item $pidFile,$stateFile -Force -ErrorAction SilentlyContinue
 }
 
 # Find the PID currently bound to a TCP port, so the supervisor can "adopt"
@@ -119,7 +180,7 @@ function Find-PortOwner([int]$port) {
   try {
     $raw = netstat -ano -p TCP 2>$null
     foreach ($line in $raw) {
-      if ($line -match "\s+$port\s.*LISTENING\s+(\d+)\s*$") {
+      if ($line -match "(?i)^\s*TCP\s+\S+:$port\s+\S+\s+LISTENING\s+(\d+)\s*$") {
         return [int]$Matches[1]
       }
     }
@@ -127,19 +188,97 @@ function Find-PortOwner([int]$port) {
   return $null
 }
 
-# ---- manual stop ----
-if ($Stop) {
-  Set-Content -Path $stopFile -Value ((Get-Date).ToString('o')) -Encoding ascii
-  Stop-ManagedInstance
-  Write-Log 'stop requested; sentinel written.'
-  exit 0
+function Test-Paused { return ((Test-Path $stopFile) -or (Test-Path $legacyStopFile)) }
+function Set-Paused($reason) {
+  Set-Content -LiteralPath $stopFile -Value "$reason $([DateTime]::UtcNow.ToString('o'))" -Encoding ascii
+  Remove-Item $legacyStopFile -Force -ErrorAction SilentlyContinue
+}
+function Clear-Paused { Remove-Item $stopFile,$legacyStopFile -Force -ErrorAction SilentlyContinue }
+
+function Start-SupervisorProcess {
+  $exe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+  $args = @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden',
+    '-File',('"' + $PSCommandPath + '"'),'-Port',[string]$Port,
+    '-RestartDelay',[string]$RestartDelay,'-UpdateCheckInterval',[string]$UpdateCheckInterval,
+    '-LogDir',('"' + $LogDir + '"'))
+  if ($BindHost) { $args += @('-BindHost',('"' + $BindHost + '"')) }
+  if ($ChildCmd) { $args += @('-ChildCmd',('"' + $ChildCmd + '"')) }
+  if ($ChildArgs) { $args += @('-ChildArgs',('"' + $ChildArgs + '"')) }
+  Start-Process -FilePath $exe -ArgumentList $args -WindowStyle Hidden -PassThru
 }
 
-# ---- manual resume (clear sentinel) ----
-if ($Start) {
-  Remove-Item $stopFile -Force -ErrorAction SilentlyContinue
-  Write-Log 'start requested; cleared stop sentinel.'
+function Get-SupervisorProcess {
+  $record = Read-JsonFile $supervisorFile
+  if (-not $record -or -not $record.pid -or -not $record.startTimeUtc) { return $null }
+  $proc = Get-Process -Id ([int]$record.pid) -ErrorAction SilentlyContinue
+  if (-not $proc) { return $null }
+  try {
+    if ($record.startTimeUtc -is [DateTime]) {
+      $expected = ([DateTime]$record.startTimeUtc).ToUniversalTime()
+    } else {
+      $expected = [DateTimeOffset]::Parse([string]$record.startTimeUtc,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind).UtcDateTime
+    }
+    if ([Math]::Abs(($proc.StartTime.ToUniversalTime() - $expected).TotalSeconds) -gt 1) { return $null }
+  } catch { return $null }
+  return $proc
 }
+
+# Controls deliberately run before DSH discovery so they remain available while
+# npm is replacing package files. Every control command returns quickly.
+if ($Status) {
+  $managed = Get-ManagedPid
+  $supervisorRunning = [bool](Get-SupervisorProcess)
+  [ordered]@{ paused=[bool](Test-Paused); supervisorRunning=$supervisorRunning;
+    dshRunning=[bool]$managed; dshPid=$managed; port=$Port; installDir=$PSScriptRoot;
+    logDir=$LogDir } | ConvertTo-Json -Compress
+  exit 0
+}
+if ($Pause) {
+  Set-Paused 'user-pause'
+  Write-Log 'pause requested; current DSH left running.'
+  Write-Output 'Paused automatic restart. Current DSH was left running.'
+  exit 0
+}
+if ($Stop) {
+  Set-Paused 'user-stop'
+  Stop-ManagedInstance
+  Write-Log 'stop requested; DSH stopped and restart paused.'
+  Write-Output 'Stopped DSH and paused automatic restart.'
+  exit 0
+}
+if ($Restart) {
+  if (Test-Paused) { Write-Error 'Automatic restart is paused. Resume first.'; exit 2 }
+  $id = Get-ManagedPid
+  if (-not $id) { Write-Error 'No valid tracked DSH process is running.'; exit 3 }
+  $supervisor = Get-SupervisorProcess
+  if (-not $supervisor) {
+    try { Start-SupervisorProcess | Out-Null } catch {
+      Write-Error "Could not start the supervisor; DSH was left running: $($_.Exception.Message)"
+      exit 4
+    }
+    $deadline = [DateTime]::UtcNow.AddSeconds(3)
+    do {
+      Start-Sleep -Milliseconds 100
+      $supervisor = Get-SupervisorProcess
+    } while (-not $supervisor -and [DateTime]::UtcNow -lt $deadline)
+    if (-not $supervisor) {
+      Write-Error 'Could not confirm a running supervisor; DSH was left running.'
+      exit 4
+    }
+  }
+  Stop-Process -Id $id -Force -ErrorAction Stop
+  Write-Output 'Restart requested.'
+  exit 0
+}
+if ($Start) {
+  Clear-Paused
+  Start-SupervisorProcess | Out-Null
+  Write-Output 'Supervision resumed.'
+  exit 0
+}
+if (Test-Paused) { Write-Log 'pause sentinel present; exiting.'; exit 0 }
 
 Write-Log "launcher starting. guarding dsh web on port $Port (crash-restart delay ${RestartDelay}s)."
 
@@ -161,8 +300,8 @@ function Start-DataNode {
     if (Test-Path $credDoc) {
       try {
         $text = Get-Content $credDoc -Raw
-        if ($text -match '^\s*DEEPSEEK_API_KEY\s*:\s*(\S+)' -and $Matches[1] -ne '') {
-          $env:DEEPSEEK_API_KEY = $Matches[1]
+        if ($text -match '(?m)^\s*DEEPSEEK_API_KEY\s*:\s*["'']?([^#\r\n"'']+)["'']?\s*(?:#.*)?$') {
+          $env:DEEPSEEK_API_KEY = $Matches[1].Trim()
           Write-Log "exported DEEPSEEK_API_KEY from $credDoc into the dsh child environment"
         }
       } catch {
@@ -198,9 +337,17 @@ function Start-DataNode {
       }
     }
     if (-not $proc) { return $null }
-    $proc.Id | Out-File -FilePath $pidFile -Encoding ascii
+    Write-ProcessRecord $stateFile $proc 'custom'
+    $proc.Id | Set-Content -LiteralPath $pidFile -Encoding ascii
     Write-Log "started custom child (pid $($proc.Id)): $ChildCmd $ChildArgs"
     return $proc
+  }
+
+  # Resolve on every launch. npm/npx updates can replace or relocate the entry.
+  $script:dshBin = Resolve-DshBin
+  if (-not $script:dshBin) {
+    Write-Log 'dsh bin.js not found (possibly updating); will retry.'
+    return $null
   }
 
   $node = (Get-Command node -ErrorAction SilentlyContinue).Source
@@ -248,72 +395,143 @@ function Start-DataNode {
     Write-Log 'Start-Process returned no handle; treating as startup failure'
     return $null
   }
-  $proc.Id | Out-File -FilePath $pidFile -Encoding ascii
+  Write-ProcessRecord $stateFile $proc 'dsh'
+  $proc.Id | Set-Content -LiteralPath $pidFile -Encoding ascii
   Write-Log "started dsh web (node pid $($proc.Id)) : dsh $webArgs"
   return $proc
 }
 
-function Wait-ChildExit($proc) {
-  # poll every 2s so an exception in Wait-Process (e.g. pid reuse) never stops us
-  while ($proc) {
-    $proc.Refresh()
-    if ($proc.HasExited) {
-      if ($proc.ExitCode -ne 0) {
-        Write-Log "child exited with non-zero code $($proc.ExitCode)"
-      }
-      return
-    }
-    if (Test-Path $stopFile) {
-      Write-Log 'stop sentinel present; stopping child.'
-      try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch { }
-      return
-    }
-    Start-Sleep -Seconds 2
+function Get-DshInstallFingerprint($binPath) {
+  if (-not $binPath -or -not (Test-Path -LiteralPath $binPath)) { return $null }
+  $packageRoot = Split-Path (Split-Path $binPath -Parent) -Parent
+  $watchFiles = @((Join-Path $packageRoot 'package.json'),$binPath)
+  $dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }
+  $profileRoot = Join-Path $dshHome 'profiles\web'
+  $profilePackage = Join-Path $profileRoot 'package.json'
+  foreach ($name in @('cordis.yml','cordis.patch.yml','package.json','pnpm-lock.yaml')) {
+    $file = Join-Path $profileRoot $name
+    if (Test-Path -LiteralPath $file) { $watchFiles += $file }
   }
+  # Watch only direct profile dependencies. This catches plugin upgrades and
+  # local edits to each declared main entry without recursively walking the
+  # potentially huge node_modules tree.
+  if (Test-Path -LiteralPath $profilePackage) {
+    try {
+      $manifest = Get-Content -LiteralPath $profilePackage -Raw | ConvertFrom-Json
+      $names = @()
+      foreach ($group in @('dependencies','devDependencies','optionalDependencies')) {
+        if ($manifest.$group) { $names += @($manifest.$group.psobject.Properties.Name) }
+      }
+      foreach ($name in @($names | Sort-Object -Unique)) {
+        $dependencyRoot = Join-Path (Join-Path $profileRoot 'node_modules') $name
+        $dependencyPackage = Join-Path $dependencyRoot 'package.json'
+        if (Test-Path -LiteralPath $dependencyPackage) {
+          $watchFiles += $dependencyPackage
+          try {
+            $dependencyManifest = Get-Content -LiteralPath $dependencyPackage -Raw | ConvertFrom-Json
+            $main = if ($dependencyManifest.main) { [string]$dependencyManifest.main } else { 'index.js' }
+            $entry = Join-Path $dependencyRoot $main
+            if (Test-Path -LiteralPath $entry -PathType Leaf) { $watchFiles += $entry }
+          } catch { }
+        }
+      }
+    } catch { Write-Log "profile package.json could not be parsed for update monitoring: $($_.Exception.Message)" }
+  }
+
+  $parts = @()
+  foreach ($file in @($watchFiles | Sort-Object -Unique)) {
+    if (-not (Test-Path -LiteralPath $file)) { return $null }
+    try {
+      $item = Get-Item -LiteralPath $file
+      $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
+      $parts += "$($item.FullName)|$($item.Length)|$($item.LastWriteTimeUtc.Ticks)|$hash"
+    } catch { return $null }
+  }
+  return ($parts -join ';')
 }
 
-# ---- supervision main loop ----
-while ($true) {
-  if (Test-Path $stopFile) {
-    Write-Log 'stop sentinel present; exiting supervision.'
-    break
+function Wait-ChildExit($proc,$initialFingerprint) {
+  $nextCheck = [DateTime]::UtcNow.AddSeconds($UpdateCheckInterval)
+  $pendingFingerprint = $null
+  while ($proc) {
+    if (Test-Paused) { return 'paused' }
+    try { $proc.Refresh(); if ($proc.HasExited) { return 'exited' } } catch { return 'exited' }
+    if (-not $ChildCmd -and $initialFingerprint -and [DateTime]::UtcNow -ge $nextCheck) {
+      $nextCheck = [DateTime]::UtcNow.AddSeconds($UpdateCheckInterval)
+      $currentFingerprint = Get-DshInstallFingerprint (Resolve-DshBin)
+      if ($currentFingerprint -and $currentFingerprint -ne $initialFingerprint) {
+        if ($pendingFingerprint -eq $currentFingerprint) { return 'updated' }
+        $pendingFingerprint = $currentFingerprint
+        Write-Log 'possible DSH package update detected; waiting for one stable recheck.'
+      } else { $pendingFingerprint = $null }
+    }
+    Start-Sleep -Seconds 1
   }
+  return 'exited'
+}
 
-  # already running? adopt and supervise to avoid double-launch.
-  # Priority: the tracked pid, else whatever owns the port right now
-  # (lets us take over a dsh web that was started some other way).
-  $existing = $null
-  $p = Get-ManagedPid
-  if ($p) { $existing = Get-Process -Id $p -ErrorAction SilentlyContinue }
-  if (-not $existing) {
-    $owner = Find-PortOwner $Port
-    if ($owner) {
-      $existing = Get-Process -Id $owner -ErrorAction SilentlyContinue
-      if ($existing) {
-        Write-Log "adopting existing port owner pid $owner on port $Port."
-        $existing.Id | Out-File -FilePath $pidFile -Encoding ascii
+function Get-SupervisorMutexName {
+  $path = [IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\').ToLowerInvariant()
+  $sha = [Security.Cryptography.SHA256]::Create()
+  try { $hash = ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($path)) | ForEach-Object {$_.ToString('x2')}) -join '' }
+  finally { $sha.Dispose() }
+  return "Local\dsh-autostart-$($hash.Substring(0,24))"
+}
+
+$mutex = New-Object Threading.Mutex($false,(Get-SupervisorMutexName))
+$hasMutex = $false
+try {
+  try { $hasMutex = $mutex.WaitOne(0,$false) } catch [Threading.AbandonedMutexException] { $hasMutex = $true }
+  if (-not $hasMutex) { Write-Log 'another supervisor is already running; exiting duplicate.'; exit 0 }
+  Write-ProcessRecord $supervisorFile (Get-Process -Id $PID) 'supervisor'
+
+  while (-not (Test-Paused)) {
+    $existing = $null
+    $p = Get-ManagedPid
+    if ($p) { $existing = Get-Process -Id $p -ErrorAction SilentlyContinue }
+    $portCollision = $false
+    if (-not $existing -and -not $ChildCmd) {
+      $owner = Find-PortOwner $Port
+      if ($owner -and (Test-IsDshWebProcess $owner)) {
+        $existing = Get-Process -Id $owner -ErrorAction SilentlyContinue
+        if ($existing) {
+          Write-ProcessRecord $stateFile $existing 'adopted-dsh'
+          $existing.Id | Set-Content -LiteralPath $pidFile -Encoding ascii
+          Write-Log "adopting verified dsh web pid $owner on port $Port."
+        }
+      } elseif ($owner) {
+        $portCollision = $true
+        Write-Log "port $Port belongs to unrelated pid $owner; refusing to adopt or kill it."
       }
     }
-  }
 
-  if ($existing) {
-    Write-Log "dsh web already running (pid $($existing.Id)); supervising."
-  } else {
-    $existing = Start-DataNode
+    if (-not $existing -and -not $portCollision) { $existing = Start-DataNode }
     if (-not $existing) {
-      Write-Log "failed to start dsh web; retrying in ${RestartDelay}s..."
       Start-Sleep -Seconds $RestartDelay
       continue
     }
-  }
 
-  Wait-ChildExit $existing
-  Write-Log "dsh web (pid $($existing.Id)) left the supervised state."
-
-  if (Test-Path $stopFile) {
-    Write-Log 'stop sentinel present after exit; exiting.'
-    break
+    $fingerprint = if ($ChildCmd) { $null } else { Get-DshInstallFingerprint (Resolve-DshBin) }
+    $reason = Wait-ChildExit $existing $fingerprint
+    if ($reason -eq 'paused') {
+      Write-Log 'automatic restart paused; current DSH left running.'
+      break
+    }
+    if ($reason -eq 'updated') {
+      Write-Log 'stable DSH package update confirmed; restarting tracked DSH.'
+      $tracked = Get-ManagedPid
+      if ($tracked -eq $existing.Id) {
+        try { Stop-Process -Id $tracked -Force -ErrorAction Stop } catch { Write-Log "update restart stop failed: $($_.Exception.Message)" }
+      }
+    } else { Write-Log "tracked process $($existing.Id) exited." }
+    Remove-Item $pidFile,$stateFile -Force -ErrorAction SilentlyContinue
+    if (-not (Test-Paused)) { Start-Sleep -Seconds $RestartDelay }
   }
-  Write-Log "restarting in ${RestartDelay}s..."
-  Start-Sleep -Seconds $RestartDelay
+} finally {
+  try {
+    $record = Read-JsonFile $supervisorFile
+    if ($record -and [int]$record.pid -eq $PID) { Remove-Item $supervisorFile -Force -ErrorAction SilentlyContinue }
+  } catch { }
+  if ($hasMutex) { try { $mutex.ReleaseMutex() } catch { } }
+  $mutex.Dispose()
 }

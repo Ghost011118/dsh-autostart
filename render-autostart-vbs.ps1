@@ -20,7 +20,9 @@
 
 param(
   # Install dir; defaults to this script's own folder (the tool package root).
-  [string]$InstallDir = ''
+  [string]$InstallDir = '',
+  # Test/portable override. Normal installs leave this empty.
+  [string]$TargetDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -34,8 +36,8 @@ if (-not (Test-Path $launcher)) {
   exit 1
 }
 
-$startupUser = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup'
-$startupAdmin = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\StartUp'
+$startupUser = [Environment]::GetFolderPath([Environment+SpecialFolder]::Startup)
+$startupAdmin = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonStartup)
 $vbsName = 'start-dsh-web.vbs'
 
 # Assemble the VBS source. Keep it a single logical line (statements joined by
@@ -54,18 +56,17 @@ $cmdInner = "powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle 
 $vbs = 'Option Explicit:Dim w:Set w=CreateObject("WScript.Shell"):w.Run "' +
        $cmdInner.Replace('"', '""') + '",0,False'
 
-$target = ''
-if (Test-Path $startupUser) { $target = $startupUser }
-elseif (Test-Path $startupAdmin) { $target = $startupAdmin }
-else { Write-Error "render-autostart-vbs: no writable Startup folder (user/admin) found" ; exit 1 }
-
-$file = Join-Path $target $vbsName
-try {
-  [System.IO.File]::WriteAllText($file, $vbs, (New-Object System.Text.UTF8Encoding($false)))
-} catch {
-  Write-Error "render-autostart-vbs: failed to write '$file': $($_.Exception.Message)"
-  exit 1
+$targets = if ($TargetDir) { @($TargetDir) } else { @($startupUser,$startupAdmin) }
+$errors = @()
+foreach ($target in $targets) {
+  if (-not $target -or -not (Test-Path -LiteralPath $target)) { continue }
+  $file = Join-Path $target $vbsName
+  try {
+    [System.IO.File]::WriteAllText($file, $vbs, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Output "OK  rendered autostart -> $file"
+    Write-Output "    launcher: $launcher"
+    exit 0
+  } catch { $errors += "${file}: $($_.Exception.Message)" }
 }
-
-Write-Output "OK  rendered autostart -> $file"
-Write-Output "    launcher: $launcher"
+Write-Error "render-autostart-vbs: no writable Startup folder. $($errors -join '; ')"
+exit 1
