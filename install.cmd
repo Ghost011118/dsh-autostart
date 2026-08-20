@@ -54,6 +54,7 @@ if /I "%~1"=="-uninstall" (
       echo [uninstall] removed "%%~S\%VBS%"
     )
   )
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%install-control-shortcut.ps1" -Uninstall
   echo [uninstall] done. Note: the running dsh web was NOT stopped.
   goto :eof
 )
@@ -68,6 +69,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%render-autostart-vbs.p
 if errorlevel 1 (
   echo [install] ERROR: could not render Startup entry; run as Administrator.
   goto :eof
+)
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%install-control-shortcut.ps1" -InstallDir "%SRC%"
+if errorlevel 1 (
+  echo [install] WARN: could not add the on-demand Start Menu control shortcut.
 )
 
 echo [install] Ready. Start now by running start-dsh-web.vbs in this folder,

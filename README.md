@@ -27,9 +27,15 @@
    - 把 `start-dsh-web.vbs` 装进「启动」文件夹（以后开机自启）；
    - 在后台启动守护进程（隐藏窗口）；
    - 若已在跑则**接管**现有 `dsh web`；
+   - 在开始菜单添加“DSH 自动启动控制”，需要暂停时搜索即可打开；
    - 检查 `http://127.0.0.1:3080` 是否可访问。
 
 之后 dsh web 就处于守护状态：开机自启、崩溃自动重启。
+
+控制器不属于 DSH 网页，也不依赖 DSH 正在运行：即使 DSH 已崩溃或网页打不开，
+仍可从开始菜单打开它来暂停、恢复或重启。控制器关闭后不会留下托盘、网页服务或
+界面进程，日常额外内存占用为零。面板会跟随 Windows 界面语言，并可用右上角的
+“English / 中文”按钮即时切换。
 
 **常用命令**（在本目录的 `cmd` 里执行）
 
@@ -53,6 +59,7 @@ setup.cmd -uninstall 移除开机自启（不停掉正在运行的 dsh web）
 | `start-dsh-web.vbs` | 开机隐形启动入口（登录时以隐藏窗口拉起守护） |
 | `dsh-web-launcher.ps1` | 守护进程本体：隐藏启动、接管现有实例、崩溃自动重启、哨兵控制 |
 | `control-dsh.cmd` / `dsh-control.ps1` | 按需控制面板；关闭后不保留托盘或界面进程 |
+| `install-control-shortcut.ps1` | 安装/移除当前用户开始菜单里的按需控制入口 |
 | `install.cmd` | 细粒度安装/卸载（`-start` / `-stop` / `-uninstall`） |
 | `readme.txt` / `说明.txt` | 中文使用说明 |
 | `logs/` `run/` | 运行时目录（自动生成，不入库） |
@@ -74,8 +81,8 @@ setup.cmd -uninstall 移除开机自启（不停掉正在运行的 dsh web）
 `lib/bin.js`；web profile 的 `cordis.yml`、`cordis.patch.yml`、
 `package.json`、`pnpm-lock.yaml`；以及 web profile 直接依赖的
 `package.json` 和声明的 main 入口。它不会递归扫描 `node_modules`，也不
-读取 sessions、storages 或日志。指纹连续两次稳定变化后才重启，避免在
-npm/pnpm 正更新到一半时启动。
+读取 sessions、storages 或日志。检测依据是文件内容，不受 DSH 启动时仅更新时间戳
+的影响；内容指纹连续两次稳定变化后才重启，避免在 npm/pnpm 正更新到一半时启动。
 
 `-pause` 只暂停自动重启，当前 DSH 保持运行；`-stop` 才会停止当前 DSH
 并暂停后续重启。所有控制命令都会快速返回。

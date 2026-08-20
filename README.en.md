@@ -27,9 +27,16 @@ default `http://127.0.0.1:3080`) just work:
    - put `start-dsh-web.vbs` into your Startup folder (autostart on logon);
    - start the supervisor in the background (hidden window);
    - ADOPT your running `dsh web` if any;
+   - add an on-demand `DSH automatic startup control` entry to Start Menu search;
    - verify `http://127.0.0.1:3080` is reachable.
 
 From then on `dsh web` is supervised: autostart on logon, restart on crash.
+
+The control panel is independent of the DSH web process. It can still pause,
+resume, or restart supervision when DSH is down. After the panel is closed it
+leaves no tray icon, web service, or UI process resident, so its idle memory
+cost is zero. It follows the Windows UI language by default and has an
+`English / 中文` button for instant switching.
 
 **Commands** (from a cmd in this folder)
 
@@ -53,6 +60,7 @@ setup.cmd -uninstall remove autostart (does NOT stop a running dsh web)
 | `start-dsh-web.vbs` | hidden logon entry (starts the supervisor at logon) |
 | `dsh-web-launcher.ps1` | the supervisor: hidden start, adopt existing, crash restart, sentinel control |
 | `control-dsh.cmd` / `dsh-control.ps1` | on-demand control panel; closing it leaves no tray/UI process resident |
+| `install-control-shortcut.ps1` | installs/removes the current-user Start Menu control entry |
 | `install.cmd` | fine-grained install/uninstall (`-start` / `-stop` / `-uninstall`) |
 | `readme.txt` / `说明.txt` | detailed usage docs |
 | `logs/` `run/` | runtime directories (auto-created, git-ignored) |
@@ -75,8 +83,10 @@ installed DSH `package.json` and `lib/bin.js`; the web profile's `cordis.yml`,
 `cordis.patch.yml`, `package.json`, and `pnpm-lock.yaml`; and only the
 `package.json` plus declared main entry of direct web-profile dependencies.
 It never recursively scans `node_modules`, sessions, storages, profiles, or
-logs. A changed fingerprint must remain stable for two checks before DSH is
-restarted, avoiding a restart in the middle of an npm/pnpm update.
+logs. Detection is content-based, so DSH touching a file timestamp during
+startup cannot create a restart loop. A changed content fingerprint must remain
+stable for two checks before DSH is restarted, avoiding a restart in the middle
+of an npm/pnpm update.
 
 `-pause` only disables supervision and leaves the current DSH process running.
 `-stop` is deliberately stronger: it stops the tracked DSH and pauses future

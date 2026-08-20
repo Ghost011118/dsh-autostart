@@ -57,6 +57,12 @@ if errorlevel 1 (
 ) else (
   echo   OK  - autostart installed (see line above)
 )
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%install-control-shortcut.ps1" -InstallDir "%SRC%"
+if errorlevel 1 (
+  echo   WARN- could not add the on-demand Start Menu control shortcut.
+) else (
+  echo   OK  - Start Menu control shortcut installed
+)
 
 REM ---------- 2) start / adopt supervisor now ----------
 echo.
@@ -118,6 +124,7 @@ for %%S in ("%STARTUP%" "%ADMIN_STARTUP%") do (
     echo   removed "%%~S\%VBS%"
   )
 )
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%install-control-shortcut.ps1" -Uninstall
 echo Done.
 pause
 goto :eof

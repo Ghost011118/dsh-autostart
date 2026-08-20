@@ -444,7 +444,10 @@ function Get-DshInstallFingerprint($binPath) {
     try {
       $item = Get-Item -LiteralPath $file
       $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
-      $parts += "$($item.FullName)|$($item.Length)|$($item.LastWriteTimeUtc.Ticks)|$hash"
+      # DSH itself can touch cordis.yml's timestamp during startup without
+      # changing its contents. Timestamps therefore cause a perpetual
+      # restart loop; content identity is the authoritative update signal.
+      $parts += "$($item.FullName)|$($item.Length)|$hash"
     } catch { return $null }
   }
   return ($parts -join ';')
