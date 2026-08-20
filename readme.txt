@@ -21,7 +21,7 @@ FILES
 INSTALL (autostart on login)
 ----------------------------
   1. Double-click  install.cmd     (installs to your Startup folder)
-  That copies start-dsh-web.vbs into
+  That renders start-dsh-web.vbs into
     %APPDATA%\...\Programs\Startup
   so it runs hidden at every logon.
   Start it immediately (no reboot) by double-clicking start-dsh-web.vbs,
@@ -36,7 +36,9 @@ CONTROL
 -------
   install.cmd            install / enable autostart
   install.cmd -start     clear the "stopped" sentinel, resume supervision
+  install.cmd -pause     pause auto-restart; keep the current dsh web running
   install.cmd -stop      stop dsh web and prevent auto-restart (one-off)
+  install.cmd -restart   request an immediate supervised restart
   install.cmd -uninstall remove the Startup entry (does NOT stop dsh web)
 
 CUSTOMIZATION
@@ -57,7 +59,7 @@ CUSTOMIZATION
       tiers" section below) - with the dsh-chat live-read change, editing
       public/*.html and gui.js never needs a restart.
   If you change -RestartDelay, also re-install the autostart? No - install.cmd
-  just copies the vbs; the delay lives in the ps1, so editing the ps1 is
+  just renders the vbs; the delay lives in the ps1, so editing the ps1 is
   enough (the vbs calls the ps1 at logon).
 
 NOTES / LIMITATIONS

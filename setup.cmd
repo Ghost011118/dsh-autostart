@@ -13,7 +13,10 @@ REM
 REM  Flags:
 REM     setup.cmd -uninstall   remove autostart (does NOT stop dsh web)
 REM     setup.cmd -stop        stop dsh web + disable auto-restart
-REM     setup.cmd -start       resume supervision (clear stop sentinel)
+REM     setup.cmd -pause       disable auto-restart; leave dsh web running
+REM     setup.cmd -start       resume supervision
+REM     setup.cmd -restart     request a supervised restart
+REM     setup.cmd -control     open the on-demand GUI
 REM
 REM  NOTE: this file is ASCII-only so output is never garbled on any
 REM  codepage. The companion .txt files have the Chinese docs.
@@ -34,7 +37,11 @@ echo ================================================
 
 if /I "%~1"=="-uninstall" goto :uninstall
 if /I "%~1"=="-stop"      goto :stop
+if /I "%~1"=="-pause"     goto :pause
 if /I "%~1"=="-start"     goto :start
+if /I "%~1"=="-restart"   goto :restart
+if /I "%~1"=="-status"    goto :status
+if /I "%~1"=="-control"   goto :control
 
 REM ---------- 1) install autostart ----------
 echo.
@@ -50,13 +57,19 @@ if errorlevel 1 (
 ) else (
   echo   OK  - autostart installed (see line above)
 )
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%install-control-shortcut.ps1" -InstallDir "%SRC%"
+if errorlevel 1 (
+  echo   WARN- could not add the on-demand Start Menu control shortcut.
+) else (
+  echo   OK  - Start Menu control shortcut installed
+)
 
 REM ---------- 2) start / adopt supervisor now ----------
 echo.
 echo [2/3] starting the supervisor now (hidden) ...
 echo   - if dsh web is already running it will be ADOPTED + supervised
 echo   - if it crashes later it will be restarted in ~2s
-start "" powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%SRC%%PS1%"
+powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SRC%%PS1%" -Start
 echo   OK  - supervisor started in background. Logs: logs\launcher-*.log
 
 REM ---------- 3) verify ----------
@@ -80,10 +93,27 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%%PS1%" -Stop
 echo Done.
 goto :eof
 
+:pause
+echo Pausing automatic restart; current dsh web will keep running ...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%%PS1%" -Pause
+goto :eof
+
 :start
 echo Resuming supervision (clearing stop sentinel) ...
 powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%%PS1%" -Start
 echo Done.
+goto :eof
+
+:restart
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%%PS1%" -Restart
+goto :eof
+
+:status
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%%PS1%" -Status
+goto :eof
+
+:control
+start "" powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%SRC%dsh-control.ps1"
 goto :eof
 
 :uninstall
@@ -94,6 +124,7 @@ for %%S in ("%STARTUP%" "%ADMIN_STARTUP%") do (
     echo   removed "%%~S\%VBS%"
   )
 )
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%install-control-shortcut.ps1" -Uninstall
 echo Done.
 pause
 goto :eof
