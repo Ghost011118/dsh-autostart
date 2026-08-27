@@ -10,6 +10,9 @@ default `http://127.0.0.1:3080`) just work:
 - 🧩 **Edit pages without restart**: the companion `dsh-chat` plugin reads its
   `public/*` static pages fresh from disk on every request, so edits show up on
   a browser refresh — no dsh restart, no interrupting an in-flight chat.
+- 🛡️ **Policy trial and automatic rollback**: after DSH Plugin Management stages a
+  policy, the supervisor saves the previous policy, performs a controlled restart
+  and local `HTTP 200` check, then restores and restarts the previous policy on failure.
 
 > Pure PowerShell / VBS / cmd. No build step, no dsh-plugin dependency.
 > Download and double-click.
@@ -91,6 +94,22 @@ of an npm/pnpm update.
 `-pause` only disables supervision and leaves the current DSH process running.
 `-stop` is deliberately stronger: it stops the tracked DSH and pauses future
 restarts. `-start`, `-pause`, `-stop`, `-restart`, and `-status` return quickly.
+
+## Controlled plugin-policy trials
+
+When DSH's **Settings → Plugins → Plugin management** page saves an admission
+policy, DSH creates a short-lived transaction in that Profile. The supervisor
+stops the managed instance, starts the candidate, and checks whether
+`http://127.0.0.1:<Port>/` returns HTTP 200 within 15 seconds:
+
+1. Success: records `applied` and clears the transaction.
+2. Failure: restores the transaction's previous policy, records `rolled-back`,
+   clears the transaction, then starts the restored instance again.
+
+Terminal history is stored in the Profile's `.dsh-plugin-governor-history.jsonl`.
+It does not read sessions, storage, or private plugin data. This is a controlled
+restart, not direct live unloading from Loader, so two lifecycle managers never
+operate on the same running instance.
 
 ---
 

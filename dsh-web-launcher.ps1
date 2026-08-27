@@ -37,9 +37,12 @@ param(
   [string]$BindHost = '',
   [int]$RestartDelay = 2,
   [ValidateRange(2, 300)][int]$UpdateCheckInterval = 5,
+  [ValidateRange(5, 300)][int]$GovernorTrialObservationSeconds = 30,
   [string]$LogDir = (Join-Path $PSScriptRoot 'logs'),
   [string]$ChildCmd = '',
   [string]$ChildArgs = '',
+  [string]$DshBin = '',
+  [string]$ProfileDir = (Join-Path $env:USERPROFILE '.dsh\profiles\web'),
   [switch]$Stop,
   [switch]$Pause,
   [switch]$Start,
@@ -54,11 +57,18 @@ $stateFile = Join-Path $runDir 'dsh-web.json'
 $stopFile = Join-Path $runDir 'pause.sentinel'
 $legacyStopFile = Join-Path $runDir 'stop.sentinel'
 $supervisorFile = Join-Path $runDir 'supervisor.json'
+$governorTransactionFile = Join-Path $ProfileDir '.dsh-plugin-governor-transaction.json'
+$governorHistoryFile = Join-Path $ProfileDir '.dsh-plugin-governor-history.jsonl'
 $stampName = Get-Date -Format 'yyyyMMdd-HHmmss'
 $logFile  = Join-Path $LogDir "launcher-$stampName-$PID.log"
 # Locate the dsh bin.js. Prefer resolving the `dsh` shim (cmd/ps1) on PATH,
 # then fall back to a global install or the npx cache it was run through.
 function Resolve-DshBin {
+  if ($DshBin) {
+    $candidate = [IO.Path]::GetFullPath($DshBin)
+    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { throw "Configured DshBin was not found: $candidate" }
+    return $candidate
+  }
   # 1) any dsh shim on the PATH (cmd/ps1) -> node_modules/@deepseek-ai/dsh
   $cmd = Get-Command dsh -ErrorAction SilentlyContinue
   if ($cmd -and $cmd.Source) {
@@ -112,6 +122,7 @@ function Get-ProcessCommandLine([int]$processId) {
 
 function Test-IsDshWebProcess([int]$processId) {
   $line = Get-ProcessCommandLine $processId
+  if ($DshBin -and $line -and $line.IndexOf([IO.Path]::GetFullPath($DshBin), [StringComparison]::OrdinalIgnoreCase) -ge 0 -and $line -match '(?:^|[\s"])web(?:[\s"]|$)') { return $true }
   return ($line -and
     $line -match '(?i)@deepseek-ai[\\/]dsh[\\/](?:lib[\\/])?bin\.js' -and
     $line -match '(?i)(?:^|[\s"])(?:web)(?:[\s"]|$)')
@@ -195,15 +206,73 @@ function Set-Paused($reason) {
 }
 function Clear-Paused { Remove-Item $stopFile,$legacyStopFile -Force -ErrorAction SilentlyContinue }
 
+function Complete-GovernorTrial($result,$reason) {
+  if (-not (Test-Path -LiteralPath $governorTransactionFile)) { return }
+  $trial = Read-JsonFile $governorTransactionFile
+  if (-not $trial) { return }
+  $record = [ordered]@{ id=$trial.id; requestedAt=$trial.requestedAt; completedAt=[DateTime]::UtcNow.ToString('o'); result=$result; reason=$reason; previous=$trial.previous; next=$trial.next }
+  # Windows PowerShell's UTF8 encoding writes a BOM for a newly-created file.
+  # The profile loader uses JSON.parse, which rejects that leading character.
+  [IO.File]::AppendAllText($governorHistoryFile, (($record | ConvertTo-Json -Compress) + [Environment]::NewLine), (New-Object Text.UTF8Encoding($false)))
+  Remove-Item -LiteralPath $governorTransactionFile -Force -ErrorAction SilentlyContinue
+}
+
+function Restore-GovernorTrial($reason) {
+  $trial = Read-JsonFile $governorTransactionFile
+  if (-not $trial) { return }
+  $manifestPath = Join-Path $ProfileDir 'package.json'
+  try {
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    if (-not $manifest.dsh) { $manifest | Add-Member -NotePropertyName dsh -NotePropertyValue ([pscustomobject]@{}) }
+    if (-not $manifest.dsh.profile) { $manifest.dsh | Add-Member -NotePropertyName profile -NotePropertyValue ([pscustomobject]@{}) }
+    if ($null -eq $trial.previous) { $manifest.dsh.profile.PSObject.Properties.Remove('governor') } else { $manifest.dsh.profile | Add-Member -Force -NotePropertyName governor -NotePropertyValue $trial.previous }
+    [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 20), (New-Object Text.UTF8Encoding($false)))
+    Complete-GovernorTrial 'rolled-back' $reason
+  } catch { Write-Log "governor rollback failed: $($_.Exception.Message)" }
+}
+
+function Confirm-GovernorTrial($proc) {
+  if (-not (Test-Path -LiteralPath $governorTransactionFile)) { return $true }
+  # Do not confirm a newly staged policy on its first successful response.
+  # Keep the transaction until it has stayed healthy for a bounded observation
+  # window, so a plugin that crashes shortly after mounting is rolled back.
+  $deadline = [DateTime]::UtcNow.AddSeconds(15)
+  $started = $false
+  do {
+    try {
+      $response = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$Port/" -TimeoutSec 2
+      if ($response.StatusCode -eq 200) { $started = $true; break }
+    } catch { }
+    Start-Sleep -Milliseconds 500
+    try { $proc.Refresh(); if ($proc.HasExited) { break } } catch { break }
+  } while ([DateTime]::UtcNow -lt $deadline)
+  if (-not $started) { Restore-GovernorTrial 'startup-health-check-failed'; return $false }
+
+  Write-Log "governor trial passed startup health check; observing for ${GovernorTrialObservationSeconds}s before confirmation."
+  $observationDeadline = [DateTime]::UtcNow.AddSeconds($GovernorTrialObservationSeconds)
+  while ([DateTime]::UtcNow -lt $observationDeadline) {
+    try { $proc.Refresh(); if ($proc.HasExited) { Restore-GovernorTrial 'process-exited-during-observation'; return $false } } catch { Restore-GovernorTrial 'process-exited-during-observation'; return $false }
+    try {
+      $response = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$Port/" -TimeoutSec 2
+      if ($response.StatusCode -ne 200) { Restore-GovernorTrial 'health-check-failed-during-observation'; return $false }
+    } catch { Restore-GovernorTrial 'health-check-failed-during-observation'; return $false }
+    Start-Sleep -Seconds 1
+  }
+  Complete-GovernorTrial 'applied' "stable-${GovernorTrialObservationSeconds}s-http-200"
+  return $true
+}
+
 function Start-SupervisorProcess {
   $exe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
   $args = @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden',
     '-File',('"' + $PSCommandPath + '"'),'-Port',[string]$Port,
     '-RestartDelay',[string]$RestartDelay,'-UpdateCheckInterval',[string]$UpdateCheckInterval,
+    '-GovernorTrialObservationSeconds',[string]$GovernorTrialObservationSeconds,
     '-LogDir',('"' + $LogDir + '"'))
   if ($BindHost) { $args += @('-BindHost',('"' + $BindHost + '"')) }
   if ($ChildCmd) { $args += @('-ChildCmd',('"' + $ChildCmd + '"')) }
   if ($ChildArgs) { $args += @('-ChildArgs',('"' + $ChildArgs + '"')) }
+  if ($DshBin) { $args += @('-DshBin',('"' + $DshBin + '"')) }
   Start-Process -FilePath $exe -ArgumentList $args -WindowStyle Hidden -PassThru
 }
 
@@ -408,7 +477,7 @@ function Get-DshInstallFingerprint($binPath) {
   $dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }
   $profileRoot = Join-Path $dshHome 'profiles\web'
   $profilePackage = Join-Path $profileRoot 'package.json'
-  foreach ($name in @('cordis.yml','cordis.patch.yml','package.json','pnpm-lock.yaml')) {
+  foreach ($name in @('cordis.yml','cordis.patch.yml','package.json','pnpm-lock.yaml','.dsh-plugin-governor-transaction.json')) {
     $file = Join-Path $profileRoot $name
     if (Test-Path -LiteralPath $file) { $watchFiles += $file }
   }
@@ -458,6 +527,11 @@ function Wait-ChildExit($proc,$initialFingerprint) {
   $pendingFingerprint = $null
   while ($proc) {
     if (Test-Paused) { return 'paused' }
+    # A policy save is staged as a transaction.  This must interrupt the
+    # normal long-running wait so the current instance is replaced by the
+    # candidate before its health check; otherwise a staged policy would only
+    # take effect after an unrelated crash or package update.
+    if (Test-Path -LiteralPath $governorTransactionFile) { return 'governor-trial' }
     try { $proc.Refresh(); if ($proc.HasExited) { return 'exited' } } catch { return 'exited' }
     if (-not $ChildCmd -and $initialFingerprint -and [DateTime]::UtcNow -ge $nextCheck) {
       $nextCheck = [DateTime]::UtcNow.AddSeconds($UpdateCheckInterval)
@@ -483,6 +557,7 @@ function Get-SupervisorMutexName {
 
 $mutex = New-Object Threading.Mutex($false,(Get-SupervisorMutexName))
 $hasMutex = $false
+$script:activeGovernorTrial = ''
 try {
   try { $hasMutex = $mutex.WaitOne(0,$false) } catch [Threading.AbandonedMutexException] { $hasMutex = $true }
   if (-not $hasMutex) { Write-Log 'another supervisor is already running; exiting duplicate.'; exit 0 }
@@ -508,17 +583,40 @@ try {
       }
     }
 
+    if ($existing -and (Test-Path -LiteralPath $governorTransactionFile)) {
+      $trial = Read-JsonFile $governorTransactionFile
+      if ($trial -and $trial.id -and $script:activeGovernorTrial -ne [string]$trial.id) {
+        $script:activeGovernorTrial = [string]$trial.id
+        Write-Log "new governor trial $($trial.id); restarting current DSH before health confirmation."
+        try { Stop-Process -Id $existing.Id -Force -ErrorAction Stop } catch { Write-Log "trial restart stop failed: $($_.Exception.Message)" }
+        Remove-Item $pidFile,$stateFile -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds $RestartDelay
+        continue
+      }
+    }
     if (-not $existing -and -not $portCollision) { $existing = Start-DataNode }
     if (-not $existing) {
       Start-Sleep -Seconds $RestartDelay
       continue
     }
 
+    if (-not (Confirm-GovernorTrial $existing)) { try { Stop-Process -Id $existing.Id -Force } catch { }; Remove-Item $pidFile,$stateFile -Force -ErrorAction SilentlyContinue; continue }
+
     $fingerprint = if ($ChildCmd) { $null } else { Get-DshInstallFingerprint (Resolve-DshBin) }
     $reason = Wait-ChildExit $existing $fingerprint
     if ($reason -eq 'paused') {
       Write-Log 'automatic restart paused; current DSH left running.'
       break
+    }
+    if ($reason -eq 'governor-trial') {
+      Write-Log 'governor trial staged; restarting tracked DSH for health confirmation.'
+      $tracked = Get-ManagedPid
+      if ($tracked -eq $existing.Id) {
+        try { Stop-Process -Id $tracked -Force -ErrorAction Stop } catch { Write-Log "trial restart stop failed: $($_.Exception.Message)" }
+      }
+      Remove-Item $pidFile,$stateFile -Force -ErrorAction SilentlyContinue
+      if (-not (Test-Paused)) { Start-Sleep -Seconds $RestartDelay }
+      continue
     }
     if ($reason -eq 'updated') {
       Write-Log 'stable DSH package update confirmed; restarting tracked DSH.'
