@@ -12,7 +12,15 @@ REM   install -uninstall remove the Startup entry (does NOT stop the service)
 REM ============================================================
 setlocal EnableExtensions
 
+REM SRC keeps %~dp0's trailing backslash because it is also used as a path
+REM PREFIX ("%SRC%%PS1%").
+REM SRC_ARG is only for "-InstallDir "%SRC_ARG%"": with %~dp0's trailing
+REM backslash the command line ends in \" which powershell -File parses as an
+REM escaped quote, so the child receives `...\dsh-autostart"` plus a stray quote
+REM and dies with "Illegal characters in path" (Test-Path / GetFullPath).
 set "SRC=%~dp0"
+set "SRC_ARG=%SRC%"
+if "%SRC_ARG:~-1%"=="\" set "SRC_ARG=%SRC_ARG:~0,-1%"
 set "VBS=start-dsh-web.vbs"
 set "PS1=dsh-web-launcher.ps1"
 
@@ -65,13 +73,20 @@ REM Render (not copy) the Startup vbs so it carries the ABSOLUTE launcher path
 REM and points back at this install dir; a plain copy leaves the vbs looking for
 REM dsh-web-launcher.ps1 inside Startup, where it never is (autostart silently
 REM did nothing).
-powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%render-autostart-vbs.ps1" -InstallDir "%SRC%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%render-autostart-vbs.ps1" -InstallDir "%SRC_ARG%"
 if errorlevel 1 (
   echo [install] ERROR: could not render Startup entry; run as Administrator.
   goto :eof
 )
+if not exist "%STARTUP%\%VBS%" if not exist "%ADMIN_STARTUP%\%VBS%" (
+  echo [install] ERROR: no autostart entry found in either Startup folder.
+  echo [install]        Single-click install only writes the current user's
+  echo [install]        Startup folder; run install.cmd as Administrator to also
+  echo [install]        cover the machine-wide one.
+  goto :eof
+)
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%install-control-shortcut.ps1" -InstallDir "%SRC%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%install-control-shortcut.ps1" -InstallDir "%SRC_ARG%"
 if errorlevel 1 (
   echo [install] WARN: could not add the on-demand Start Menu control shortcut.
 )

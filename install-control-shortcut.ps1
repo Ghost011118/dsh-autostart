@@ -6,7 +6,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$InstallDir = [IO.Path]::GetFullPath($InstallDir.TrimEnd([IO.Path]::DirectorySeparatorChar))
+# Tolerate a trailing separator (cmd's %~dp0 always has one) and the stray
+# double-quote that a quoted `...\` argument used to inject; either would make
+# GetFullPath throw ArgumentException ("illegal characters in path").
+$InstallDir = ($InstallDir.Trim().Trim('"')).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+if (-not $InstallDir) {
+  throw 'The install directory could not be resolved.'
+}
+$InstallDir = [IO.Path]::GetFullPath($InstallDir)
 if (-not $ProgramsDir) {
   $ProgramsDir = [Environment]::GetFolderPath('Programs')
 }
