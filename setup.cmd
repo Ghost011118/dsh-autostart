@@ -23,7 +23,15 @@ REM  codepage. The companion .txt files have the Chinese docs.
 REM ============================================================
 setlocal EnableExtensions
 
+REM SRC keeps %~dp0's trailing backslash because it is also used as a path
+REM PREFIX ("%SRC%render-autostart-vbs.ps1", "%SRC%%PS1%").
+REM SRC_ARG is only for "-InstallDir "%SRC_ARG%"": with %~dp0's trailing
+REM backslash the command line ends in \" which powershell -File parses as an
+REM escaped quote, so the child receives `...\dsh-autostart"` plus a stray quote
+REM and dies with "Illegal characters in path" (Test-Path / GetFullPath).
 set "SRC=%~dp0"
+set "SRC_ARG=%SRC%"
+if "%SRC_ARG:~-1%"=="\" set "SRC_ARG=%SRC_ARG:~0,-1%"
 set "VBS=start-dsh-web.vbs"
 set "PS1=dsh-web-launcher.ps1"
 set "STARTUP=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
@@ -50,14 +58,14 @@ REM The Startup entry is RENDERED (not copied) so it carries the absolute
 REM launcher path and points back at this install dir; a plain copy would leave
 REM the vbs looking for dsh-web-launcher.ps1 inside the Startup folder, where it
 REM never is (root cause of autostart silently doing nothing).
-powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%render-autostart-vbs.ps1" -InstallDir "%SRC%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%render-autostart-vbs.ps1" -InstallDir "%SRC_ARG%"
 if errorlevel 1 (
   echo   WARN- could not render autostart into Startup. Autostart skipped,
   echo         but the supervisor can still start below.
 ) else (
   echo   OK  - autostart installed (see line above)
 )
-powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%install-control-shortcut.ps1" -InstallDir "%SRC%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%install-control-shortcut.ps1" -InstallDir "%SRC_ARG%"
 if errorlevel 1 (
   echo   WARN- could not add the on-demand Start Menu control shortcut.
 ) else (

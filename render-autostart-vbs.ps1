@@ -30,6 +30,13 @@ $ErrorActionPreference = 'Stop'
 if ([string]::IsNullOrWhiteSpace($InstallDir)) {
   $InstallDir = Split-Path $MyInvocation.MyCommand.Path -Parent
 }
+# Tolerate a trailing separator (cmd's %~dp0 always has one) and the stray
+# double-quote that a quoted `...\` argument used to inject; either would make
+# Join-Path produce a path that Test-Path rejects as "illegal characters".
+$InstallDir = $InstallDir.Trim().Trim('"').TrimEnd('\', '/')
+if (-not $InstallDir) {
+  $InstallDir = Split-Path $MyInvocation.MyCommand.Path -Parent
+}
 $launcher = Join-Path $InstallDir 'dsh-web-launcher.ps1'
 if (-not (Test-Path $launcher)) {
   Write-Error "render-autostart-vbs: dsh-web-launcher.ps1 not found in '$InstallDir'"
@@ -63,10 +70,19 @@ foreach ($target in $targets) {
   $file = Join-Path $target $vbsName
   try {
     [System.IO.File]::WriteAllText($file, $vbs, (New-Object System.Text.UTF8Encoding($false)))
+    # Read the bytes back: WriteAllText can silently not take effect for a
+    # virtualized/redirected Startup folder, and a 0-byte or stale entry is
+    # exactly the "autostart silently does nothing" failure this script exists
+    # to prevent. Report it instead of claiming success.
+    $written = [System.IO.File]::ReadAllText($file)
+    if ($written -notlike "*$launcherEscaped*") {
+      $errors += "${file}: verification failed (launcher path missing from the rendered file)"
+      continue
+    }
     Write-Output "OK  rendered autostart -> $file"
     Write-Output "    launcher: $launcher"
     exit 0
   } catch { $errors += "${file}: $($_.Exception.Message)" }
 }
-Write-Error "render-autostart-vbs: no writable Startup folder. $($errors -join '; ')"
+Write-Error "render-autostart-vbs: could not write and verify the Startup entry. $($errors -join '; ')"
 exit 1
